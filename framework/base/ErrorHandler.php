@@ -7,274 +7,354 @@
 
 namespace yii\base;
 
+use Yii;
+use yii\helpers\VarDumper;
+use yii\web\HttpException;
+
 /**
  * ErrorHandler handles uncaught PHP errors and exceptions.
  *
- * ErrorHandler displays these errors using appropriate views based on the
- * nature of the errors and the mode the application runs at.
+ * ErrorHandler is configured as an application component in [[\yii\base\Application]] by default.
+ * You can access that instance via `Yii::$app->errorHandler`.
+ *
+ * For more details and usage information on ErrorHandler, see the [guide article on handling errors](guide:runtime-handling-errors).
  *
  * @author Qiang Xue <qiang.xue@gmail.com>
+ * @author Alexander Makarov <sam@rmcreative.ru>
+ * @author Carsten Brandt <mail@cebe.cc>
  * @since 2.0
  */
-class ErrorHandler extends Component
+abstract class ErrorHandler extends Component
 {
-	/**
-	 * @var integer maximum number of source code lines to be displayed. Defaults to 25.
-	 */
-	public $maxSourceLines = 25;
-	/**
-	 * @var integer maximum number of trace source code lines to be displayed. Defaults to 10.
-	 */
-	public $maxTraceSourceLines = 10;
-	/**
-	 * @var boolean whether to discard any existing page output before error display. Defaults to true.
-	 */
-	public $discardExistingOutput = true;
-	/**
-	 * @var string the route (eg 'site/error') to the controller action that will be used to display external errors.
-	 * Inside the action, it can retrieve the error information by \Yii::$app->errorHandler->error.
-	 * This property defaults to null, meaning ErrorHandler will handle the error display.
-	 */
-	public $errorAction;
-	/**
-	 * @var string the path of the view file for rendering exceptions
-	 */
-	public $exceptionView = '@yii/views/exception.php';
-	/**
-	 * @var string the path of the view file for rendering errors
-	 */
-	public $errorView = '@yii/views/error.php';
-	/**
-	 * @var \Exception the exception that is being handled currently
-	 */
-	public $exception;
+    /**
+     * @var bool whether to discard any existing page output before error display. Defaults to true.
+     */
+    public $discardExistingOutput = true;
+    /**
+     * @var int the size of the reserved memory. A portion of memory is pre-allocated so that
+     * when an out-of-memory issue occurs, the error handler is able to handle the error with
+     * the help of this reserved memory. If you set this value to be 0, no memory will be reserved.
+     * Defaults to 256KB.
+     */
+    public $memoryReserveSize = 262144;
+    /**
+     * @var \Exception|null the exception that is being handled currently.
+     */
+    public $exception;
+
+    /**
+     * @var string Used to reserve memory for fatal error handler.
+     */
+    private $_memoryReserve;
+    /**
+     * @var \Exception from HHVM error that stores backtrace
+     */
+    private $_hhvmException;
 
 
-	/**
-	 * Handles exception
-	 * @param \Exception $exception
-	 */
-	public function handle($exception)
-	{
-		$this->exception = $exception;
+    /**
+     * Register this error handler.
+     */
+    public function register()
+    {
+        ini_set('display_errors', false);
+        set_exception_handler([$this, 'handleException']);
+        if (defined('HHVM_VERSION')) {
+            set_error_handler([$this, 'handleHhvmError']);
+        } else {
+            set_error_handler([$this, 'handleError']);
+        }
+        if ($this->memoryReserveSize > 0) {
+            $this->_memoryReserve = str_repeat('x', $this->memoryReserveSize);
+        }
+        register_shutdown_function([$this, 'handleFatalError']);
+    }
 
-		if ($this->discardExistingOutput) {
-			$this->clearOutput();
-		}
+    /**
+     * Unregisters this error handler by restoring the PHP error and exception handlers.
+     */
+    public function unregister()
+    {
+        restore_error_handler();
+        restore_exception_handler();
+    }
 
-		$this->renderException($exception);
-	}
+    /**
+     * Handles uncaught PHP exceptions.
+     *
+     * This method is implemented as a PHP exception handler.
+     *
+     * @param \Exception $exception the exception that is not caught
+     */
+    public function handleException($exception)
+    {
+        if ($exception instanceof ExitException) {
+            return;
+        }
 
-	/**
-	 * Renders exception
-	 * @param \Exception $exception
-	 */
-	protected function renderException($exception)
-	{
-		if ($this->errorAction !== null) {
-			\Yii::$app->runAction($this->errorAction);
-		} elseif (\Yii::$app instanceof \yii\web\Application) {
-			if (!headers_sent()) {
-				$errorCode = $exception instanceof HttpException ? $exception->statusCode : 500;
-				header("HTTP/1.0 $errorCode " . get_class($exception));
-			}
-			if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && $_SERVER['HTTP_X_REQUESTED_WITH'] === 'XMLHttpRequest') {
-				\Yii::$app->renderException($exception);
-			} else {
-				// if there is an error during error rendering it's useful to
-				// display PHP error in debug mode instead of a blank screen
-				if(YII_DEBUG) {
-					ini_set('display_errors', 1);
-				}
+        $this->exception = $exception;
 
-				$view = new View;
-				if (!YII_DEBUG || $exception instanceof UserException) {
-					$viewName = $this->errorView;
-				} else {
-					$viewName = $this->exceptionView;
-				}
-				echo $view->renderFile($viewName, array(
-					'exception' => $exception,
-				), $this);
-			}
-		} else {
-			\Yii::$app->renderException($exception);
-		}
-	}
+        // disable error capturing to avoid recursive errors while handling exceptions
+        $this->unregister();
 
-	/**
-	 * Returns server and Yii version information.
-	 * @return string server version information.
-	 */
-	public function getVersionInfo()
-	{
-		$version = '<a href="http://www.yiiframework.com/">Yii Framework</a>/' . \Yii::getVersion();
-		if (isset($_SERVER['SERVER_SOFTWARE'])) {
-			$version = $_SERVER['SERVER_SOFTWARE'] . ' ' . $version;
-		}
-		return $version;
-	}
+        // set preventive HTTP status code to 500 in case error handling somehow fails and headers are sent
+        // HTTP exceptions will override this value in renderException()
+        if (PHP_SAPI !== 'cli') {
+            http_response_code(500);
+        }
 
-	/**
-	 * Converts arguments array to its string representation
-	 *
-	 * @param array $args arguments array to be converted
-	 * @return string string representation of the arguments array
-	 */
-	public function argumentsToString($args)
-	{
-		$isAssoc = $args !== array_values($args);
-		$count = 0;
-		foreach ($args as $key => $value) {
-			$count++;
-			if ($count >= 5) {
-				if ($count > 5) {
-					unset($args[$key]);
-				} else {
-					$args[$key] = '...';
-				}
-				continue;
-			}
+        try {
+            $this->logException($exception);
+            if ($this->discardExistingOutput) {
+                $this->clearOutput();
+            }
+            $this->renderException($exception);
+            if (!YII_ENV_TEST) {
+                \Yii::getLogger()->flush(true);
+                if (defined('HHVM_VERSION')) {
+                    flush();
+                }
+                exit(1);
+            }
+        } catch (\Exception $e) {
+            // an other exception could be thrown while displaying the exception
+            $this->handleFallbackExceptionMessage($e, $exception);
+        } catch (\Throwable $e) {
+            // additional check for \Throwable introduced in PHP 7
+            $this->handleFallbackExceptionMessage($e, $exception);
+        }
 
-			if (is_object($value)) {
-				$args[$key] = get_class($value);
-			} elseif (is_bool($value)) {
-				$args[$key] = $value ? 'true' : 'false';
-			} elseif (is_string($value)) {
-				if (strlen($value) > 64) {
-					$args[$key] = '"' . substr($value, 0, 64) . '..."';
-				} else {
-					$args[$key] = '"' . $value . '"';
-				}
-			} elseif (is_array($value)) {
-				$args[$key] = 'array(' . $this->argumentsToString($value) . ')';
-			} elseif ($value === null) {
-				$args[$key] = 'null';
-			} elseif (is_resource($value)) {
-				$args[$key] = 'resource';
-			}
+        $this->exception = null;
+    }
 
-			if (is_string($key)) {
-				$args[$key] = '"' . $key . '" => ' . $args[$key];
-			} elseif ($isAssoc) {
-				$args[$key] = $key . ' => ' . $args[$key];
-			}
-		}
-		return implode(', ', $args);
-	}
+    /**
+     * Handles exception thrown during exception processing in [[handleException()]].
+     * @param \Exception|\Throwable $exception Exception that was thrown during main exception processing.
+     * @param \Exception $previousException Main exception processed in [[handleException()]].
+     * @since 2.0.11
+     */
+    protected function handleFallbackExceptionMessage($exception, $previousException)
+    {
+        $msg = "An Error occurred while handling another error:\n";
+        $msg .= (string) $exception;
+        $msg .= "\nPrevious exception:\n";
+        $msg .= (string) $previousException;
+        if (YII_DEBUG) {
+            if (PHP_SAPI === 'cli') {
+                echo $msg . "\n";
+            } else {
+                echo '<pre>' . htmlspecialchars($msg, ENT_QUOTES, Yii::$app->charset) . '</pre>';
+            }
+        } else {
+            echo 'An internal server error occurred.';
+        }
+        $msg .= "\n\$_SERVER = " . VarDumper::export($_SERVER);
+        error_log($msg);
+        if (defined('HHVM_VERSION')) {
+            flush();
+        }
+        exit(1);
+    }
 
-	/**
-	 * Returns a value indicating whether the call stack is from application code.
-	 * @param array $trace the trace data
-	 * @return boolean whether the call stack is from application code.
-	 */
-	public function isCoreCode($trace)
-	{
-		if (isset($trace['file'])) {
-			return $trace['file'] === 'unknown' || strpos(realpath($trace['file']), YII_PATH . DIRECTORY_SEPARATOR) === 0;
-		}
-		return false;
-	}
+    /**
+     * Handles HHVM execution errors such as warnings and notices.
+     *
+     * This method is used as a HHVM error handler. It will store exception that will
+     * be used in fatal error handler
+     *
+     * @param int $code the level of the error raised.
+     * @param string $message the error message.
+     * @param string $file the filename that the error was raised in.
+     * @param int $line the line number the error was raised at.
+     * @param mixed $context
+     * @param mixed $backtrace trace of error
+     * @return bool whether the normal error handler continues.
+     *
+     * @throws ErrorException
+     * @since 2.0.6
+     */
+    public function handleHhvmError($code, $message, $file, $line, $context, $backtrace)
+    {
+        if ($this->handleError($code, $message, $file, $line)) {
+            return true;
+        }
+        if (E_ERROR & $code) {
+            $exception = new ErrorException($message, $code, $code, $file, $line);
+            $ref = new \ReflectionProperty('\Exception', 'trace');
+            $ref->setAccessible(true);
+            $ref->setValue($exception, $backtrace);
+            $this->_hhvmException = $exception;
+        }
 
-	/**
-	 * Renders the source code around the error line.
-	 * @param string $file source file path
-	 * @param integer $errorLine the error line number
-	 * @param integer $maxLines maximum number of lines to display
-	 */
-	public function renderSourceCode($file, $errorLine, $maxLines)
-	{
-		$errorLine--; // adjust line number to 0-based from 1-based
-		if ($errorLine < 0 || ($lines = @file($file)) === false || ($lineCount = count($lines)) <= $errorLine) {
-			return;
-		}
+        return false;
+    }
 
-		$halfLines = (int)($maxLines / 2);
-		$beginLine = $errorLine - $halfLines > 0 ? $errorLine - $halfLines : 0;
-		$endLine = $errorLine + $halfLines < $lineCount ? $errorLine + $halfLines : $lineCount - 1;
-		$lineNumberWidth = strlen($endLine + 1);
+    /**
+     * Handles PHP execution errors such as warnings and notices.
+     *
+     * This method is used as a PHP error handler. It will simply raise an [[ErrorException]].
+     *
+     * @param int $code the level of the error raised.
+     * @param string $message the error message.
+     * @param string $file the filename that the error was raised in.
+     * @param int $line the line number the error was raised at.
+     * @return bool whether the normal error handler continues.
+     *
+     * @throws ErrorException
+     */
+    public function handleError($code, $message, $file, $line)
+    {
+        if (error_reporting() & $code) {
+            // load ErrorException manually here because autoloading them will not work
+            // when error occurs while autoloading a class
+            if (!class_exists('yii\\base\\ErrorException', false)) {
+                require_once __DIR__ . '/ErrorException.php';
+            }
+            $exception = new ErrorException($message, $code, $code, $file, $line);
 
-		$output = '';
-		for ($i = $beginLine; $i <= $endLine; ++$i) {
-			$isErrorLine = $i === $errorLine;
-			$code = sprintf("<span class=\"ln" . ($isErrorLine ? ' error-ln' : '') . "\">%0{$lineNumberWidth}d</span> %s", $i + 1, $this->htmlEncode(str_replace("\t", '    ', $lines[$i])));
-			if (!$isErrorLine) {
-				$output .= $code;
-			} else {
-				$output .= '<span class="error">' . $code . '</span>';
-			}
-		}
-		echo '<div class="code"><pre>' . $output . '</pre></div>';
-	}
+            // in case error appeared in __toString method we can't throw any exception
+            $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+            array_shift($trace);
+            foreach ($trace as $frame) {
+                if ($frame['function'] === '__toString') {
+                    $this->handleException($exception);
+                    if (defined('HHVM_VERSION')) {
+                        flush();
+                    }
+                    exit(1);
+                }
+            }
 
-	/**
-	 * Renders calls stack trace
-	 * @param array $trace
-	 */
-	public function renderTrace($trace)
-	{
-		$count = 0;
-		echo "<table>\n";
-		foreach ($trace as $n => $t) {
-			if ($this->isCoreCode($t)) {
-				$cssClass = 'core collapsed';
-			} elseif (++$count > 3) {
-				$cssClass = 'app collapsed';
-			} else {
-				$cssClass = 'app expanded';
-			}
+            throw $exception;
+        }
 
-			$hasCode = isset($t['file']) && $t['file'] !== 'unknown' && is_file($t['file']);
-			echo "<tr class=\"trace $cssClass\"><td class=\"number\">#$n</td><td class=\"content\">";
-			echo '<div class="trace-file">';
-			if ($hasCode) {
-				echo '<div class="plus">+</div><div class="minus">-</div>';
-			}
-			echo '&nbsp;';
-			if(isset($t['file'])) {
-				echo $this->htmlEncode($t['file']) . '(' . $t['line'] . '): ';
-			}
-			if (!empty($t['class'])) {
-				echo '<strong>' . $t['class'] . '</strong>' . $t['type'];
-			}
-			echo '<strong>' . $t['function'] . '</strong>';
-			echo '(' . (empty($t['args']) ? '' : $this->htmlEncode($this->argumentsToString($t['args']))) . ')';
-			echo '</div>';
-			if ($hasCode) {
-				$this->renderSourceCode($t['file'], $t['line'], $this->maxTraceSourceLines);
-			}
-			echo "</td></tr>\n";
-		}
-		echo '</table>';
-	}
+        return false;
+    }
 
-	/**
-	 * Converts special characters to HTML entities
-	 * @param string $text text to encode
-	 * @return string
-	 */
-	public function htmlEncode($text)
-	{
-		return htmlspecialchars($text, ENT_QUOTES, \Yii::$app->charset);
-	}
+    /**
+     * Handles fatal PHP errors.
+     */
+    public function handleFatalError()
+    {
+        unset($this->_memoryReserve);
 
-	public function clearOutput()
-	{
-		// the following manual level counting is to deal with zlib.output_compression set to On
-		for ($level = ob_get_level(); $level > 0; --$level) {
-			@ob_end_clean();
-		}
-	}
+        // load ErrorException manually here because autoloading them will not work
+        // when error occurs while autoloading a class
+        if (!class_exists('yii\\base\\ErrorException', false)) {
+            require_once __DIR__ . '/ErrorException.php';
+        }
 
-	/**
-	 * @param \Exception $exception
-	 */
-	public function renderAsHtml($exception)
-	{
-		$view = new View;
-		$name = !YII_DEBUG || $exception instanceof HttpException ? $this->errorView : $this->exceptionView;
-		echo $view->renderFile($name, array(
-			'exception' => $exception,
-		), $this);
-	}
+        $error = error_get_last();
+
+        if (ErrorException::isFatalError($error)) {
+            if (!empty($this->_hhvmException)) {
+                $exception = $this->_hhvmException;
+            } else {
+                $exception = new ErrorException($error['message'], $error['type'], $error['type'], $error['file'], $error['line']);
+            }
+            $this->exception = $exception;
+
+            $this->logException($exception);
+
+            if ($this->discardExistingOutput) {
+                $this->clearOutput();
+            }
+            $this->renderException($exception);
+
+            // need to explicitly flush logs because exit() next will terminate the app immediately
+            Yii::getLogger()->flush(true);
+            if (defined('HHVM_VERSION')) {
+                flush();
+            }
+            exit(1);
+        }
+    }
+
+    /**
+     * Renders the exception.
+     * @param \Exception $exception the exception to be rendered.
+     */
+    abstract protected function renderException($exception);
+
+    /**
+     * Logs the given exception.
+     * @param \Exception $exception the exception to be logged
+     * @since 2.0.3 this method is now public.
+     */
+    public function logException($exception)
+    {
+        $category = get_class($exception);
+        if ($exception instanceof HttpException) {
+            $category = 'yii\\web\\HttpException:' . $exception->statusCode;
+        } elseif ($exception instanceof \ErrorException) {
+            $category .= ':' . $exception->getSeverity();
+        }
+        Yii::error($exception, $category);
+    }
+
+    /**
+     * Removes all output echoed before calling this method.
+     */
+    public function clearOutput()
+    {
+        // the following manual level counting is to deal with zlib.output_compression set to On
+        for ($level = ob_get_level(); $level > 0; --$level) {
+            if (!@ob_end_clean()) {
+                ob_clean();
+            }
+        }
+    }
+
+    /**
+     * Converts an exception into a PHP error.
+     *
+     * This method can be used to convert exceptions inside of methods like `__toString()`
+     * to PHP errors because exceptions cannot be thrown inside of them.
+     * @param \Exception $exception the exception to convert to a PHP error.
+     */
+    public static function convertExceptionToError($exception)
+    {
+        trigger_error(static::convertExceptionToString($exception), E_USER_ERROR);
+    }
+
+    /**
+     * Converts an exception into a simple string.
+     * @param \Exception|\Error $exception the exception being converted
+     * @return string the string representation of the exception.
+     */
+    public static function convertExceptionToString($exception)
+    {
+        if ($exception instanceof UserException) {
+            return "{$exception->getName()}: {$exception->getMessage()}";
+        }
+
+        if (YII_DEBUG) {
+            return static::convertExceptionToVerboseString($exception);
+        }
+
+        return 'An internal server error occurred.';
+    }
+
+    /**
+     * Converts an exception into a string that has verbose information about the exception and its trace.
+     * @param \Exception|\Error $exception the exception being converted
+     * @return string the string representation of the exception.
+     *
+     * @since 2.0.14
+     */
+    public static function convertExceptionToVerboseString($exception)
+    {
+        if ($exception instanceof Exception) {
+            $message = "Exception ({$exception->getName()})";
+        } elseif ($exception instanceof ErrorException) {
+            $message = (string)$exception->getName();
+        } else {
+            $message = 'Exception';
+        }
+        $message .= " '" . get_class($exception) . "' with message '{$exception->getMessage()}' \n\nin "
+            . $exception->getFile() . ':' . $exception->getLine() . "\n\n"
+            . "Stack trace:\n" . $exception->getTraceAsString();
+
+        return $message;
+    }
 }

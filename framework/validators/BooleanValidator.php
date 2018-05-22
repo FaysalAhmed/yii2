@@ -8,7 +8,6 @@
 namespace yii\validators;
 
 use Yii;
-use yii\helpers\Html;
 
 /**
  * BooleanValidator checks if the attribute value is a boolean value.
@@ -21,85 +20,86 @@ use yii\helpers\Html;
  */
 class BooleanValidator extends Validator
 {
-	/**
-	 * @var mixed the value representing true status. Defaults to '1'.
-	 */
-	public $trueValue = '1';
-	/**
-	 * @var mixed the value representing false status. Defaults to '0'.
-	 */
-	public $falseValue = '0';
-	/**
-	 * @var boolean whether the comparison to [[trueValue]] and [[falseValue]] is strict.
-	 * When this is true, the attribute value and type must both match those of [[trueValue]] or [[falseValue]].
-	 * Defaults to false, meaning only the value needs to be matched.
-	 */
-	public $strict = false;
+    /**
+     * @var mixed the value representing true status. Defaults to '1'.
+     */
+    public $trueValue = '1';
+    /**
+     * @var mixed the value representing false status. Defaults to '0'.
+     */
+    public $falseValue = '0';
+    /**
+     * @var bool whether the comparison to [[trueValue]] and [[falseValue]] is strict.
+     * When this is true, the attribute value and type must both match those of [[trueValue]] or [[falseValue]].
+     * Defaults to false, meaning only the value needs to be matched.
+     */
+    public $strict = false;
 
-	/**
-	 * Initializes the validator.
-	 */
-	public function init()
-	{
-		parent::init();
-		if ($this->message === null) {
-			$this->message = Yii::t('yii|{attribute} must be either "{true}" or "{false}".');
-		}
-	}
 
-	/**
-	 * Validates the attribute of the object.
-	 * If there is any error, the error message is added to the object.
-	 * @param \yii\base\Model $object the object being validated
-	 * @param string $attribute the attribute being validated
-	 */
-	public function validateAttribute($object, $attribute)
-	{
-		$value = $object->$attribute;
-		if (!$this->validateValue($value)) {
-			$this->addError($object, $attribute, $this->message, array(
-				'{true}' => $this->trueValue,
-				'{false}' => $this->falseValue,
-			));
-		}
-	}
+    /**
+     * {@inheritdoc}
+     */
+    public function init()
+    {
+        parent::init();
+        if ($this->message === null) {
+            $this->message = Yii::t('yii', '{attribute} must be either "{true}" or "{false}".');
+        }
+    }
 
-	/**
-	 * Validates the given value.
-	 * @param mixed $value the value to be validated.
-	 * @return boolean whether the value is valid.
-	 */
-	public function validateValue($value)
-	{
-		return !$this->strict && ($value == $this->trueValue || $value == $this->falseValue)
-			|| $this->strict && ($value === $this->trueValue || $value === $this->falseValue);
-	}
+    /**
+     * {@inheritdoc}
+     */
+    protected function validateValue($value)
+    {
+        if ($this->strict) {
+            $valid = $value === $this->trueValue || $value === $this->falseValue;
+        } else {
+            $valid = $value == $this->trueValue || $value == $this->falseValue;
+        }
 
-	/**
-	 * Returns the JavaScript needed for performing client-side validation.
-	 * @param \yii\base\Model $object the data object being validated
-	 * @param string $attribute the name of the attribute to be validated.
-	 * @return string the client-side validation script.
-	 */
-	public function clientValidateAttribute($object, $attribute)
-	{
-		$options = array(
-			'trueValue' => $this->trueValue,
-			'falseValue' => $this->falseValue,
-			'message' => Html::encode(strtr($this->message, array(
-				'{attribute}' => $object->getAttributeLabel($attribute),
-				'{value}' => $object->$attribute,
-				'{true}' => $this->trueValue,
-				'{false}' => $this->falseValue,
-			))),
-		);
-		if ($this->skipOnEmpty) {
-			$options['skipOnEmpty'] = 1;
-		}
-		if ($this->strict) {
-			$options['strict'] = 1;
-		}
+        if (!$valid) {
+            return [$this->message, [
+                'true' => $this->trueValue === true ? 'true' : $this->trueValue,
+                'false' => $this->falseValue === false ? 'false' : $this->falseValue,
+            ]];
+        }
 
-		return 'yii.validation.boolean(value, messages, ' . json_encode($options) . ');';
-	}
+        return null;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function clientValidateAttribute($model, $attribute, $view)
+    {
+        ValidationAsset::register($view);
+        $options = $this->getClientOptions($model, $attribute);
+
+        return 'yii.validation.boolean(value, messages, ' . json_encode($options, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . ');';
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getClientOptions($model, $attribute)
+    {
+        $options = [
+            'trueValue' => $this->trueValue,
+            'falseValue' => $this->falseValue,
+            'message' => $this->formatMessage($this->message, [
+                'attribute' => $model->getAttributeLabel($attribute),
+                'true' => $this->trueValue === true ? 'true' : $this->trueValue,
+                'false' => $this->falseValue === false ? 'false' : $this->falseValue,
+            ]),
+        ];
+        if ($this->skipOnEmpty) {
+            $options['skipOnEmpty'] = 1;
+        }
+        if ($this->strict) {
+            $options['strict'] = 1;
+        }
+
+        return $options;
+    }
 }
